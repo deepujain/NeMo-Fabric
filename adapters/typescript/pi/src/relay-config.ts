@@ -300,8 +300,14 @@ export async function loadRelayPluginConfig(input: AdapterStartInput): Promise<R
   return pluginConfig;
 }
 
+// JSON escapes U+0000 to U+001F but leaves U+007F raw, and TOML 1.0 requires it escaped in basic strings.
+// Every other escape JSON.stringify emits is also a valid TOML escape.
+function tomlString(value: string): string {
+  return JSON.stringify(value).replaceAll("\u007f", "\\u007f");
+}
+
 function tomlKey(value: string): string {
-  return /^[A-Za-z0-9_-]+$/.test(value) ? value : JSON.stringify(value);
+  return /^[A-Za-z0-9_-]+$/.test(value) ? value : tomlString(value);
 }
 
 function tomlPath(parts: string[]): string {
@@ -310,7 +316,7 @@ function tomlPath(parts: string[]): string {
 
 function tomlScalar(value: unknown): string {
   if (typeof value === "string") {
-    return JSON.stringify(value);
+    return tomlString(value);
   }
   if (typeof value === "boolean") {
     return value ? "true" : "false";

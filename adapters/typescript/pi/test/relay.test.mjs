@@ -364,6 +364,19 @@ endpoint = "http://127.0.0.1:4320/v1/traces"
   assert.throws(() => encodeToml({ unsupported: null }), /unsupported by the local TOML encoder/);
 });
 
+test("escapes every TOML control character in string values and quoted keys", () => {
+  // TOML 1.0 requires U+0000 to U+0008, U+000A to U+001F and U+007F to be escaped in basic strings.
+  // JSON.stringify covers all of them except U+007F.
+  assert.equal(encodeToml({ note: "a\u007fb" }), 'note = "a\\u007fb"\n');
+  assert.equal(encodeToml({ "k\u007f": "v" }), '"k\\u007f" = "v"\n');
+  assert.equal(encodeToml({ table: { "k\u007f": { inner: 1 } } }), '[table]\n\n[table."k\\u007f"]\ninner = 1\n');
+  assert.equal(encodeToml({ list: ["a\u007fb", "c"] }), 'list = ["a\\u007fb", "c"]\n');
+  assert.equal(
+    encodeToml({ tab: "a\tb", unit_separator: "a\u001fb" }),
+    'tab = "a\\tb"\nunit_separator = "a\\u001fb"\n',
+  );
+});
+
 test("rejects removed and malformed Relay OpenTelemetry shapes", () => {
   assert.throws(
     () => validateRelayObservability(observability({ openinference: {} })),
