@@ -324,7 +324,10 @@ def test_remote_agent_accepts_relay_atof_for_invoke_stream(tmp_path: Path):
     assert plan["telemetry_plan"]["relay_enabled"] is True
     assert plan["telemetry_plan"]["providers"] == ["relay"]
     assert plan["telemetry_plan"]["adapter_outputs"] == ["atof"]
-    assert plan["adapter_descriptor"]["descriptor"]["capabilities"]["streaming"]
+    # Relay-backed invoke_stream does not need the native OpenAI streaming claim.
+    assert (
+        plan["adapter_descriptor"]["descriptor"]["capabilities"]["streaming"] is False
+    )
 
 
 def test_openclaw_rejects_relay(tmp_path: Path):

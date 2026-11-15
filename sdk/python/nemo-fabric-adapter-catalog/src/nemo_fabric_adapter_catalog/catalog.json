@@ -3264,7 +3264,7 @@
         "capabilities": {
           "cancellation": false,
           "service": false,
-          "streaming": true,
+          "streaming": false,
           "updates": false
         },
         "config": {
@@ -3391,7 +3391,7 @@
         "name": "nemo-fabric-adapters-remote-agent",
         "version": "0.7.0"
       },
-      "sha256": "39870c056b7aa15b8706b6cabf9190029f6c9165c5c9ce4b427f5f18bd7ba70a",
+      "sha256": "7185cf87ed78e56466acd634e5397e09a51c12581f05288cce225bd1a989e833",
       "source": "adapters/python/remote-agent/remote-agent.fabric-adapter.json"
     },
     "nvidia.fabric.strands": {

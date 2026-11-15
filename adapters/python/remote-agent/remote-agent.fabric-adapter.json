@@ -81,7 +81,7 @@
   },
   "capabilities": {
     "service": false,
-    "streaming": true,
+    "streaming": false,
     "updates": false,
     "cancellation": false
   },

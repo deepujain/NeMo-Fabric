@@ -494,7 +494,10 @@ def test_remote_agent_descriptor_and_module_entrypoint(repo_root: Path):
         "openai-responses"
     )
     assert descriptor["config"]["system_instruction_modes"] == ["replace"]
-    assert descriptor["capabilities"]["streaming"] is True
+    # The flag claims native OpenAI streaming, which needs invoke_openai_stream.
+    # Relay-backed streaming does not read it.
+    assert descriptor["capabilities"]["streaming"] is False
+    assert not hasattr(adapter.RemoteAgentRuntime, "invoke_openai_stream")
     assert descriptor["telemetry"]["providers"]["relay"] == {
         "outputs": ["atof"],
         "integration_modes": ["remote_service"],
