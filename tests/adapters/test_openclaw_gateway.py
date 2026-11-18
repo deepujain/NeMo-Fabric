@@ -69,8 +69,193 @@ async def test_session_calls_share_one_authenticated_connection(
         await asyncio.wait_for(connections[0].wait_closed(), 2)
 
 
+async def _serve_with_event_bursts(socket, *, burst: int, requests: list[dict]):
+    """Answer RPCs, then flood the idle connection with unsolicited events."""
+    await socket.send(
+        json.dumps(
+            {
+                "type": "event",
+                "event": "connect.challenge",
+                "payload": {"nonce": "challenge"},
+            }
+        )
+    )
+    async for message in socket:
+        request = json.loads(message)
+        requests.append(request)
+        payload = (
+            {"type": "hello-ok", "protocol": 4}
+            if request["method"] == "connect"
+            else {"method": request["method"], "key": request["params"]["key"]}
+        )
+        await socket.send(
+            json.dumps(
+                {"type": "res", "id": request["id"], "ok": True, "payload": payload}
+            )
+        )
+        if request["method"] != "connect":
+            for index in range(burst):
+                await socket.send(
+                    json.dumps(
+                        {"type": "event", "event": "agent", "payload": {"n": index}}
+                    )
+                )
+
+
+async def test_session_stays_responsive_while_idle_between_calls(unused_tcp_port):
+    # The Gateway keeps emitting events while a native turn runs over HTTP and no
+    # RPC is waiting on this connection. Unread events must not stall keepalive.
+    requests: list[dict] = []
+
+    async def respond(socket):
+        await _serve_with_event_bursts(socket, burst=200, requests=requests)
+
+    async with serve(
+        respond, "127.0.0.1", unused_tcp_port, ping_interval=0.2, ping_timeout=0.5
+    ):
+        client = gateway.SessionClient(
+            f"http://127.0.0.1:{unused_tcp_port}", "private-test-token"
+        )
+        try:
+            assert await client.call("sessions.describe", {"key": "first"}, timeout=2)
+            await asyncio.sleep(1.5)
+            assert await client.call(
+                "sessions.describe", {"key": "second"}, timeout=2
+            ) == {"method": "sessions.describe", "key": "second"}
+        finally:
+            await client.close()
+        assert [request["method"] for request in requests] == [
+            "connect",
+            "sessions.describe",
+            "sessions.describe",
+        ]
+
+
+async def test_session_events_before_a_response_are_discarded(unused_tcp_port):
+    async def respond(socket):
+        await socket.send(
+            json.dumps(
+                {
+                    "type": "event",
+                    "event": "connect.challenge",
+                    "payload": {"nonce": "challenge"},
+                }
+            )
+        )
+        async for message in socket:
+            request = json.loads(message)
+            for index in range(64):
+                await socket.send(
+                    json.dumps({"type": "event", "event": "agent", "payload": index})
+                )
+            payload = (
+                {"type": "hello-ok", "protocol": 4}
+                if request["method"] == "connect"
+                else {"method": request["method"]}
+            )
+            await socket.send(
+                json.dumps(
+                    {
+                        "type": "res",
+                        "id": request["id"],
+                        "ok": True,
+                        "payload": payload,
+                    }
+                )
+            )
+
+    async with serve(respond, "127.0.0.1", unused_tcp_port):
+        client = gateway.SessionClient(
+            f"http://127.0.0.1:{unused_tcp_port}", "private-test-token"
+        )
+        try:
+            for method in ("sessions.describe", "sessions.history", "sessions.abort"):
+                assert await client.call(method, {"key": "selected"}, timeout=2) == {
+                    "method": method
+                }
+        finally:
+            await client.close()
+
+
+async def test_session_close_stops_the_receiver(unused_tcp_port):
+    requests: list[dict] = []
+
+    def client_tasks() -> list[asyncio.Task]:
+        return [
+            task
+            for task in asyncio.all_tasks()
+            if getattr(task.get_coro(), "__qualname__", "").startswith("SessionClient.")
+            and task is not asyncio.current_task()
+        ]
+
+    async def respond(socket):
+        await _serve_with_event_bursts(socket, burst=3, requests=requests)
+
+    async with serve(respond, "127.0.0.1", unused_tcp_port):
+        client = gateway.SessionClient(
+            f"http://127.0.0.1:{unused_tcp_port}", "private-test-token"
+        )
+        assert await client.call("sessions.describe", {"key": "selected"}, timeout=2)
+        assert len(client_tasks()) == 1
+        await client.close()
+        assert client_tasks() == []
+        with pytest.raises(LifecycleError):
+            await client.call("sessions.describe", {"key": "selected"}, timeout=2)
+
+
+async def test_closing_the_client_releases_a_waiting_call(unused_tcp_port):
+    received = asyncio.Event()
+
+    async def respond(socket):
+        await socket.send(
+            json.dumps(
+                {
+                    "type": "event",
+                    "event": "connect.challenge",
+                    "payload": {"nonce": "challenge"},
+                }
+            )
+        )
+        async for message in socket:
+            request = json.loads(message)
+            if request["method"] == "connect":
+                await socket.send(
+                    json.dumps(
+                        {
+                            "type": "res",
+                            "id": request["id"],
+                            "ok": True,
+                            "payload": {"type": "hello-ok", "protocol": 4},
+                        }
+                    )
+                )
+            else:
+                received.set()
+
+    async with serve(respond, "127.0.0.1", unused_tcp_port):
+        client = gateway.SessionClient(
+            f"http://127.0.0.1:{unused_tcp_port}", "private-test-token"
+        )
+        waiting = asyncio.create_task(
+            client.call("sessions.describe", {"key": "selected"}, timeout=30)
+        )
+        await asyncio.wait_for(received.wait(), 2)
+        await client.close()
+        with pytest.raises(LifecycleError):
+            await asyncio.wait_for(waiting, 2)
+
+
 @pytest.mark.parametrize(
-    "failure", ["authentication", "rpc", "timeout", "cancel", "disconnect", "invalid"]
+    "failure",
+    [
+        "authentication",
+        "rpc",
+        "timeout",
+        "cancel",
+        "disconnect",
+        "invalid",
+        "unknown_response",
+    ],
 )
 async def test_session_failures_close_connection_without_replay(
     unused_tcp_port, failure
@@ -111,6 +296,12 @@ async def test_session_failures_close_connection_without_replay(
                 await socket.close()
             elif failure == "invalid":
                 await socket.send("not-json-secret-server-detail")
+            elif failure == "unknown_response":
+                await socket.send(
+                    json.dumps(
+                        {"type": "res", "id": "unrelated", "ok": True, "payload": {}}
+                    )
+                )
             else:
                 await socket.send(
                     json.dumps(

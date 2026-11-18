@@ -32,6 +32,14 @@ class _DirectConnect(connect):
 
 
 class SessionClient:
+    """Serialize native session RPCs over one connection a receiver keeps drained.
+
+    The Gateway streams events for as long as a native turn runs, including while
+    no session RPC is waiting. A receiver task reads every frame, resolves the
+    response each RPC awaits, and discards events, so unread frames never fill the
+    socket's receive queue or stall WebSocket keepalive.
+    """
+
     def __init__(self, gateway_url: str, token: str):
         parsed = urlsplit(gateway_url)
         self._url = urlunsplit(
@@ -39,35 +47,75 @@ class SessionClient:
         )
         self._token = token
         self._connection: ClientConnection | None = None
+        self._receiver: asyncio.Task[None] | None = None
+        self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._lock = asyncio.Lock()
         self._failed = False
 
-    async def _response(self, identifier: str) -> dict[str, Any]:
-        assert self._connection is not None
-        while True:
-            frame = json.loads(await self._connection.recv())
-            if not isinstance(frame, dict):
-                raise ValueError("Invalid Gateway frame")
-            if frame.get("type") == "event":
-                continue
-            if (
-                frame.get("type") != "res"
-                or frame.get("id") != identifier
-                or frame.get("ok") is not True
-                or not isinstance(frame.get("payload"), dict)
-            ):
-                raise ValueError("Gateway operation was not confirmed")
-            return frame["payload"]
+    async def _receive(self, connection: ClientConnection) -> None:
+        failure: BaseException = OSError("Gateway receiver stopped")
+        try:
+            while True:
+                frame = json.loads(await connection.recv())
+                if not isinstance(frame, dict):
+                    raise ValueError("Invalid Gateway frame")
+                if frame.get("type") == "event":
+                    continue
+                identifier = frame.get("id")
+                pending = (
+                    self._pending.get(identifier)
+                    if frame.get("type") == "res" and isinstance(identifier, str)
+                    else None
+                )
+                if pending is None:
+                    raise ValueError("Unexpected Gateway frame")
+                if pending.done():
+                    continue
+                if frame.get("ok") is not True or not isinstance(
+                    frame.get("payload"), dict
+                ):
+                    pending.set_exception(
+                        ValueError("Gateway operation was not confirmed")
+                    )
+                else:
+                    pending.set_result(frame["payload"])
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            failure = error
+            self._failed = True
+            await connection.close()
+        finally:
+            for pending in self._pending.values():
+                if not pending.done():
+                    pending.set_exception(failure)
 
     async def _request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         assert self._connection is not None
+        assert self._receiver is not None
         identifier = str(uuid4())
-        await self._connection.send(
-            json.dumps(
-                {"type": "req", "id": identifier, "method": method, "params": params}
-            )
+        pending: asyncio.Future[dict[str, Any]] = (
+            asyncio.get_running_loop().create_future()
         )
-        return await self._response(identifier)
+        self._pending[identifier] = pending
+        try:
+            if self._receiver.done():
+                raise OSError("Gateway receiver stopped")
+            await self._connection.send(
+                json.dumps(
+                    {
+                        "type": "req",
+                        "id": identifier,
+                        "method": method,
+                        "params": params,
+                    }
+                )
+            )
+            return await pending
+        finally:
+            del self._pending[identifier]
+            if pending.done() and not pending.cancelled():
+                pending.exception()  # Mark a failure nobody awaited as retrieved.
 
     async def call(
         self, method: str, params: dict[str, Any], *, timeout: float
@@ -95,6 +143,9 @@ class SessionClient:
                             or challenge.get("event") != "connect.challenge"
                         ):
                             raise ValueError("Gateway challenge is unavailable")
+                        self._receiver = asyncio.create_task(
+                            self._receive(self._connection)
+                        )
                         hello = await self._request(
                             "connect",
                             {
@@ -133,6 +184,10 @@ class SessionClient:
 
     async def close(self) -> None:
         self._failed = True
+        receiver, self._receiver = self._receiver, None
         connection, self._connection = self._connection, None
+        if receiver is not None:
+            receiver.cancel()
+            await asyncio.gather(receiver, return_exceptions=True)
         if connection is not None:
             await connection.close()
