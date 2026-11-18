@@ -3,7 +3,12 @@
 
 """Fabric behavior survives creation of additional native Hermes agents."""
 
+import json
 import os
+import threading
+from collections.abc import Iterator
+from http.server import BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
@@ -211,3 +216,211 @@ def test_native_relay_finalization_failure_is_reported_without_raising(
     )
 
     assert "Hermes native turn Relay finalization failed" in caplog.text
+
+
+def _anthropic_config(base_url: str | None, **model: str) -> AgentConfig:
+    route = {"provider": "anthropic", "model": "configured-model", **model}
+    if base_url is not None:
+        route["base_url"] = base_url
+    return AgentConfig.from_mapping({"models": {"default": route}})
+
+
+@pytest.mark.parametrize("api_key_env", [None, "FABRIC_ROUTE_KEY"])
+def test_native_anthropic_endpoint_is_written_as_a_messages_route(api_key_env):
+    endpoint = "https://gateway.example/v1"
+    extra = {} if api_key_env is None else {"api_key_env": api_key_env}
+    key_env = api_key_env or "ANTHROPIC_API_KEY"
+
+    config = configuration.build_hermes_config(
+        _anthropic_config(endpoint, **extra), workspace=".", interfaces={"api": 8642}
+    )
+
+    assert config["model"] == {
+        "provider": "custom",
+        "default": "configured-model",
+        "base_url": endpoint,
+        "api_key": f"${{{key_env}}}",
+        "api_mode": "anthropic_messages",
+    }
+    assert config["providers"] == {
+        "custom": {
+            "base_url": endpoint,
+            "key_env": key_env,
+            "api_mode": "anthropic_messages",
+        }
+    }
+
+
+def test_native_anthropic_route_without_an_endpoint_stays_native():
+    config = configuration.build_hermes_config(
+        _anthropic_config(None), workspace=".", interfaces={"api": 8642}
+    )
+
+    assert config["model"] == {"provider": "anthropic", "default": "configured-model"}
+    assert "providers" not in config
+
+
+def test_embedded_anthropic_agent_still_receives_its_endpoint_as_an_argument():
+    endpoint = "https://gateway.example/v1"
+
+    config = configuration.build_hermes_config(
+        _anthropic_config(endpoint), workspace="."
+    )
+
+    assert config["model"] == {
+        "provider": "anthropic",
+        "default": "configured-model",
+        "base_url": endpoint,
+    }
+    assert "providers" not in config
+
+
+def test_native_openai_route_does_not_declare_a_messages_protocol():
+    config = configuration.build_hermes_config(
+        AgentConfig.from_mapping(
+            {
+                "models": {
+                    "default": {
+                        "provider": "openai",
+                        "model": "configured-model",
+                        "base_url": "https://gateway.example/v1",
+                    }
+                }
+            }
+        ),
+        workspace=".",
+        interfaces={"api": 8642},
+    )
+
+    assert "api_mode" not in config["model"]
+    assert "api_mode" not in config["providers"]["custom"]
+
+
+class _MessagesStub(BaseHTTPRequestHandler):
+    """Record each request and answer with a minimal Anthropic message."""
+
+    requests: list[tuple[str, dict[str, str]]]
+
+    def do_POST(self):  # noqa: N802
+        self.rfile.read(int(self.headers.get("content-length", 0)))
+        self.requests.append((self.path, dict(self.headers)))
+        body = json.dumps(
+            {
+                "id": "msg_stub",
+                "type": "message",
+                "role": "assistant",
+                "model": "configured-model",
+                "content": [{"type": "text", "text": "stub reply"}],
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            }
+        ).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+@pytest.fixture(name="messages_stub")
+def messages_stub_fixture() -> Iterator[tuple[str, list[tuple[str, dict[str, str]]]]]:
+    handler = type("Handler", (_MessagesStub,), {"requests": []})
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}", handler.requests
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+_ENDPOINT_PREFIXES = pytest.mark.parametrize(
+    ("prefix", "expected_path"),
+    [
+        ("/v1", "/v1/messages"),
+        ("/anthropic/v1", "/anthropic/v1/messages"),
+        ("/gateway/models", "/gateway/models/v1/messages"),
+        ("", "/v1/messages"),
+    ],
+    ids=["v1", "anthropic-v1", "unrecognized-path", "no-path"],
+)
+
+
+def _resolve_native_route(tmp_path, interface: str, endpoint: str) -> dict:
+    """Resolve the route Hermes's own processes pick from the written config."""
+    from hermes_cli.config import load_config
+    from hermes_cli.runtime_provider import frozen_runtime_config
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+    configuration.write_hermes_config(
+        _anthropic_config(endpoint, api_key_env="FABRIC_ROUTE_KEY"),
+        tmp_path / "hermes",
+        workspace=str(tmp_path),
+        interfaces=[interface],
+    )
+    environment = {
+        "HOME": str(tmp_path),
+        "HERMES_HOME": str(tmp_path / "hermes"),
+        "FABRIC_ROUTE_KEY": "openshell",
+        # The adapter exports the route's key under the provider's default name.
+        "ANTHROPIC_API_KEY": "openshell",
+    }
+    with patch.dict(os.environ, environment, clear=True):
+        native_config = load_config()
+        with frozen_runtime_config(native_config):
+            return resolve_runtime_provider(
+                requested=native_config["model"]["provider"],
+                target_model="configured-model",
+            )
+
+
+@pytest.mark.usefixtures("requires_hermes_agent")
+@pytest.mark.parametrize("interface", ["api", "dashboard"])
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "https://gateway.example/v1",
+        "https://gateway.example/gateway/models",
+        "https://gateway.example/anthropic/v1",
+        "https://api.anthropic.com",
+    ],
+)
+def test_native_anthropic_route_resolves_to_the_declared_endpoint(
+    tmp_path, interface, endpoint
+):
+    route = _resolve_native_route(tmp_path, interface, endpoint)
+
+    assert route["base_url"] == endpoint
+    assert route["api_mode"] == "anthropic_messages"
+    assert route["api_key"] == "openshell"
+
+
+@pytest.mark.usefixtures("requires_hermes_agent")
+@pytest.mark.parametrize("interface", ["api", "dashboard"])
+@_ENDPOINT_PREFIXES
+def test_native_anthropic_route_sends_messages_to_the_declared_endpoint(
+    tmp_path, messages_stub, interface, prefix, expected_path
+):
+    pytest.importorskip("anthropic")
+    from agent.anthropic_adapter import build_anthropic_client
+
+    origin, requests = messages_stub
+    route = _resolve_native_route(tmp_path, interface, origin + prefix)
+
+    client = build_anthropic_client(route["api_key"], route["base_url"])
+    client.messages.create(
+        model="configured-model",
+        max_tokens=8,
+        messages=[{"role": "user", "content": "hello"}],
+    )
+
+    assert [path for path, _ in requests] == [expected_path]
+    headers = {name.lower(): value for name, value in requests[0][1].items()}
+    assert headers["x-api-key"] == "openshell"
+    assert "authorization" not in headers

@@ -26,6 +26,7 @@ PROVIDER_DEFAULT_API_KEY_ENV = {
     "openai": "OPENAI_API_KEY",
     "openrouter": "OPENROUTER_API_KEY",
 }
+ANTHROPIC_MESSAGES_API_MODE = "anthropic_messages"
 DEFAULT_MAX_ITERATIONS = 90
 
 
@@ -101,22 +102,42 @@ def disabled_toolsets(config: AgentConfig) -> list[str]:
     return config.tools.blocked if config.tools is not None else []
 
 
+def _custom_route_api_mode(model_config: AgentModelConfig) -> str | None:
+    """Return the wire protocol Hermes's ``custom`` provider must speak, if any.
+
+    Hermes sends an ``anthropic`` route's requests to ``model.base_url`` only
+    for hosts and paths it recognizes as Anthropic's, and to
+    ``https://api.anthropic.com`` otherwise. The ``custom`` provider takes any
+    endpoint and honors a declared protocol, so an ``anthropic`` route is
+    written as ``custom`` with the Messages protocol.
+    """
+
+    provider = str(model_config.provider or "").lower()
+    return ANTHROPIC_MESSAGES_API_MODE if provider == "anthropic" else None
+
+
 def _interface_model(model_config: AgentModelConfig) -> dict[str, Any]:
     """Return the model section Hermes's own processes read from config.yaml.
 
     Fabric's embedded agent receives the endpoint and key as arguments; the
     gateway and dashboard read them from config.yaml, where Hermes's ``openai``
-    provider ignores ``base_url``. The key stays in the environment.
+    provider ignores ``base_url`` and its ``anthropic`` provider ignores one it
+    does not recognize as Anthropic's. A route with an endpoint is written as
+    Hermes's ``custom`` provider, which uses ``base_url`` as declared. The key
+    stays in the environment.
     """
 
     provider = str(model_config.provider or "").lower()
-    if model_config.base_url and provider in {"openai", "custom"}:
-        return {
+    if model_config.base_url and provider in {"openai", "custom", "anthropic"}:
+        model = {
             "provider": "custom",
             "default": model_config.model,
             "base_url": model_config.base_url,
             "api_key": f"${{{_api_key_env(model_config)}}}",
         }
+        if api_mode := _custom_route_api_mode(model_config):
+            model["api_mode"] = api_mode
+        return model
     return common_utils.without_none(
         {
             "provider": model_config.provider,
@@ -195,10 +216,13 @@ def build_hermes_config(
             # Hermes ignores model.api_key for openrouter.ai and reads
             # OPENROUTER_API_KEY instead. Bind this route's declared key first.
             config["providers"] = {
-                "custom": {
-                    "base_url": model_config.base_url,
-                    "key_env": _api_key_env(model_config),
-                }
+                "custom": common_utils.without_none(
+                    {
+                        "base_url": model_config.base_url,
+                        "key_env": _api_key_env(model_config),
+                        "api_mode": _custom_route_api_mode(model_config),
+                    }
+                )
             }
     if "api" in interfaces:
         config["agent"]["cron_drain_timeout"] = GATEWAY_DRAIN_TIMEOUT_SECONDS
